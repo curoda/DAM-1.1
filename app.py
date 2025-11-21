@@ -1,609 +1,307 @@
-#!/usr/bin/env python3
-"""
-DAM 1.1 Phase II – single-file implementation.
-
-Core tasks:
-  - Read geometry & velocities from CSV.
-  - Generate plane waves (p,q,r) for given W, K using spherical Fibonacci sampling.
-  - Build g-matrix and column-norms Λ.
-  - Build [V] diagonal from plane-wave direction cosines.
-  - Compute pressure using Phase II operator:
-        A_x = (1/N) * V * Λ^{-1} * (g^H v_x)
-        A_y = ...
-        A_z = ...
-        p = g A_x + g A_y + g A_z
-  - Write per-point real/imag, magnitude, phase of p to CSV.
-
-Inputs (main run):
-  - geometry CSV path
-  - N: number of geometry points (used to sanity-check)
-  - W: integerization multiplier
-  - lambda_: wavelength
-  - K: number of plane waves (default 3N)
-
-Plane-wave cache:
-  - .dam_cache/pqr_W{W}_K{K}.npz
-
-Convenience:
-  - precompute_default_pqrs() can build & cache p,q,r for K in [800,1600,2400,3200].
-"""
-
-from __future__ import annotations
-import os
-import math
-import argparse
-from dataclasses import dataclass
-from typing import Dict, IO, Optional, Tuple, List, Union
+# app.py
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import streamlit as st
-from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+from dam11_phase2_core import (
+    Phase2Config,
+    geometry_from_dataframe,
+    generate_pqr,
+    compute_pressure_phase2,
+)
 
 
-# -----------------------------
-# Data models
-# -----------------------------
+st.set_page_config(
+    page_title="DAM 1.1 Phase II – Pulsating Sphere",
+    layout="wide",
+)
 
-@dataclass
-class Phase2Config:
-    geom_csv: str          # geometry+velocity CSV
-    N: int                 # expected number of points
-    W: float               # multiplier for integerizing plane-wave directions
-    lambda_: float         # wavelength
-    K: int                 # number of plane waves (columns of g)
-    axis_avoid_deg: float = 20.0
-    cache_dir: str = ".dam_cache"
+st.title("DAM 1.1 Phase II – Pulsating Sphere Surface Pressure")
 
-
-@dataclass
-class Geometry:
-    positions: np.ndarray      # (N,3) [l,m,n]
-    velocities: np.ndarray     # (N,3) complex [vx,vy,vz]
-    meta: Dict[str, object]
-
-
-@dataclass
-class PlaneWaveSet:
-    pqr: np.ndarray            # (K,3) int32
-    octant_counts: Tuple[int, ...]
-
-
-# -----------------------------
-# Geometry & velocity reader
-# -----------------------------
-
-def read_geometry_csv(path: Union[str, IO[str]]) -> Geometry:
+st.markdown(
     """
-    Read geometry + velocities from CSV.
+This app generates a **pulsating sphere** test case and computes surface
+pressure using the DAM 1.1 Phase II operator.
 
-    Expected columns:
-      l, m, n,
-      vx_real, vx_imag,
-      vy_real, vy_imag,
-      vz_real, vz_imag
+Instead of uploading geometry, the app constructs it for you:
+
+- Points on a sphere of radius `R` using spherical Fibonacci sampling  
+- Radial unit velocity at each point (pulsating sphere)
+"""
+)
+
+
+# -----------------------------
+# Spherical Fibonacci geometry
+# -----------------------------
+
+def spherical_fibonacci_points(N: int, radius: float):
+    """
+    Generate N points on a sphere of given radius using the spherical
+    Fibonacci method, plus associated unit radial directions.
 
     Returns:
-      Geometry(
-        positions: (N,3) float64,
-        velocities: (N,3) complex128,
-        meta: dict
-      )
+      pts  : (N,3) positions [l,m,n]
+      dirs : (N,3) unit radial vectors
     """
-    df = pd.read_csv(path)
-
-    required = ["l", "m", "n",
-                "vx_real", "vx_imag",
-                "vy_real", "vy_imag",
-                "vz_real", "vz_imag"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns in {path}: {missing}")
-
-    positions = df[["l", "m", "n"]].to_numpy(dtype=float)
-    vx = df["vx_real"].to_numpy(dtype=float) + 1j * df["vx_imag"].to_numpy(dtype=float)
-    vy = df["vy_real"].to_numpy(dtype=float) + 1j * df["vy_imag"].to_numpy(dtype=float)
-    vz = df["vz_real"].to_numpy(dtype=float) + 1j * df["vz_imag"].to_numpy(dtype=float)
-    velocities = np.column_stack([vx, vy, vz]).astype(np.complex128)
-
-    source_name = path if isinstance(path, str) else getattr(path, "name", None)
-    meta = {
-        "source": os.path.basename(source_name) if source_name else "uploaded.csv",
-        "units_length": "arbitrary",
-        "units_velocity": "arbitrary",
-    }
-
-    return Geometry(positions=positions, velocities=velocities, meta=meta)
-
-
-# -----------------------------
-# Plane-wave utilities
-# -----------------------------
-
-def spherical_fibonacci(n: int) -> np.ndarray:
-    """
-    Generate n roughly uniformly-distributed unit vectors on S^2
-    using a spherical Fibonacci (golden-angle) construction.
-
-    Returns:
-      (n,3) array of float64 unit vectors.
-    """
-    i = np.arange(n, dtype=np.float64)
-    phi = (1 + 5 ** 0.5) / 2.0
+    i = np.arange(N, dtype=np.float64)
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
     ga = 2.0 * np.pi * (1.0 - 1.0 / phi)
-    z = 1.0 - 2.0 * (i + 0.5) / n
+
+    z = 1.0 - 2.0 * (i + 0.5) / N
     r = np.sqrt(np.maximum(0.0, 1.0 - z * z))
     theta = ga * i
+
     x = r * np.cos(theta)
     y = r * np.sin(theta)
-    u = np.stack([x, y, z], axis=1)
-    u /= np.linalg.norm(u, axis=1, keepdims=True)
-    return u
 
+    pts_unit = np.stack([x, y, z], axis=1)
+    # Normalize to be safe
+    pts_unit /= np.linalg.norm(pts_unit, axis=1, keepdims=True)
 
-def within_axis_cone(u: np.ndarray, deg: float) -> np.ndarray:
-    """
-    Return boolean mask of directions to keep (outside ±deg about x,y,z axes).
-    """
-    if deg <= 0:
-        return np.ones(len(u), dtype=bool)
-    cos_thr = np.cos(np.deg2rad(deg))
-    ux, uy, uz = np.abs(u[:, 0]), np.abs(u[:, 1]), np.abs(u[:, 2])
-    bad = (ux >= cos_thr) | (uy >= cos_thr) | (uz >= cos_thr)
-    return ~bad
-
-
-def octant_index(v: np.ndarray) -> np.ndarray:
-    """
-    Map vectors to octant index 0..7 based on sign of components.
-
-    Octant mapping:
-      sign(x),sign(y),sign(z) → 3-bit index.
-    """
-    s = (v >= 0).astype(np.int32)
-    return (s[:, 0] << 2) + (s[:, 1] << 1) + s[:, 2]
-
-
-def dedupe_triplets(pqr: np.ndarray) -> np.ndarray:
-    """
-    Remove duplicate integer triplets, keeping first occurrence.
-    """
-    if len(pqr) == 0:
-        return pqr
-    a = np.ascontiguousarray(pqr, dtype=np.int32)
-    b = a.view([("p", np.int32), ("q", np.int32), ("r", np.int32)])
-    _, idx = np.unique(b, return_index=True)
-    return a[np.sort(idx)]
-
-
-def forbid_mirrors(pqr: np.ndarray) -> np.ndarray:
-    """
-    Remove mirror pairs (v and -v), keeping the first representative.
-    """
-    if len(pqr) == 0:
-        return pqr
-    a = np.ascontiguousarray(pqr, dtype=np.int32)
-    seen = set()
-    keep_idx: List[int] = []
-    for i, (p, q, r) in enumerate(a):
-        # Canonical representative up to sign:
-        if (p, q, r) >= (-p, -q, -r):
-            key = (p, q, r)
-        else:
-            key = (-p, -q, -r)
-        if key in seen:
-            continue
-        seen.add(key)
-        keep_idx.append(i)
-    return a[np.array(keep_idx, dtype=np.int64)]
-
-
-def plane_wave_cache_path(cache_dir: str, W: float, K: int) -> str:
-    os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, f"pqr_W{W:g}_K{K}.npz")
-
-
-def generate_pqr(config: Phase2Config) -> PlaneWaveSet:
-    """
-    Generate or load a set of plane-wave integer directions (p,q,r) of length K.
-
-    Includes:
-      - spherical Fibonacci base directions
-      - ±axis_avoid_deg cone removal about x,y,z
-      - zero-vector removal
-      - duplicate removal
-      - mirror-pair removal
-      - simple octant balancing (target ≈ K/8 per octant)
-
-    Cached on disk in .npz for reuse.
-    """
-    cache_path = plane_wave_cache_path(config.cache_dir, config.W, config.K)
-    if os.path.exists(cache_path):
-        data = np.load(cache_path)
-        pqr = data["pqr"].astype(np.int32)
-    else:
-        # Base unit directions
-        u = spherical_fibonacci(10000)
-        # Axis avoidance
-        u = u[within_axis_cone(u, config.axis_avoid_deg)]
-        # Quantize: round(W*u)
-        pqr = np.rint(config.W * u).astype(np.int32)
-        # Remove zero vectors
-        pqr = pqr[np.any(pqr != 0, axis=1)]
-        # Remove duplicates
-        pqr = dedupe_triplets(pqr)
-        # Remove mirror pairs
-        pqr = forbid_mirrors(pqr)
-
-        # Octant balancing
-        oct_idx = octant_index(pqr)
-        counts = np.zeros(8, dtype=int)
-        selected: List[np.ndarray] = []
-        target = (config.K + 7) // 8
-        for i, v in enumerate(pqr):
-            o = oct_idx[i]
-            if counts[o] < target:
-                selected.append(v)
-                counts[o] += 1
-                if len(selected) == config.K:
-                    break
-        # Top-up sequentially if needed
-        if len(selected) < config.K:
-            for v in pqr:
-                if len(selected) == config.K:
-                    break
-                selected.append(v)
-        pqr = np.array(selected[:config.K], dtype=np.int32)
-
-        # Save cache
-        np.savez_compressed(cache_path, pqr=pqr)
-
-    oct_counts = tuple(np.bincount(octant_index(pqr), minlength=8).tolist())
-    return PlaneWaveSet(pqr=pqr, octant_counts=oct_counts)
-
-
-def precompute_default_pqrs(W: float = 500.0,
-                            Ks: Tuple[int, ...] = (800, 1600, 2400, 3200),
-                            cache_dir: str = ".dam_cache") -> None:
-    """
-    Convenience function: generate and cache plane-wave sets for
-    several K values (800,1600,2400,3200) at a given W.
-
-    Call once if you want those ready to go.
-    """
-    for K in Ks:
-        cfg = Phase2Config(
-            geom_csv="",  # not used here
-            N=0,
-            W=W,
-            lambda_=1.0,  # unused for pqr
-            K=K,
-            cache_dir=cache_dir
-        )
-        pw = generate_pqr(cfg)
-        print(f"Cached pqr for W={W}, K={K}, octant_counts={pw.octant_counts}")
+    pts = radius * pts_unit
+    return pts, pts_unit
 
 
 # -----------------------------
-# Core Phase II operator
+# Sidebar controls
 # -----------------------------
 
-def build_g(positions: np.ndarray, pqr: np.ndarray, W: float, lambda_: float) -> np.ndarray:
-    """
-    Build g-matrix:
+st.sidebar.header("Sphere & Phase II Parameters")
 
-      g[i,k] = exp( j * 2π/(W λ) * ( l_i p_k + m_i q_k + n_i r_k ) )
+# Geometry
+N = st.sidebar.number_input(
+    "N (number of surface points)",
+    min_value=4,
+    value=80,
+    step=1,
+    help="Number of points on the spherical radiator surface.",
+)
 
-    positions: (N,3) floats [l,m,n]
-    pqr:       (K,3) ints   [p,q,r]
-    """
-    lmn = positions.astype(np.float64)
-    pqr_f = pqr.astype(np.float64)
-    scale = 2.0 * np.pi / (W * lambda_)
-    dots = lmn @ pqr_f.T   # (N,K)
-    phases = scale * dots
-    g = np.exp(1j * phases)
-    return g.astype(np.complex128)
+radius = st.sidebar.number_input(
+    "Sphere radius",
+    min_value=1.0,
+    value=100.0,
+    step=1.0,
+    help="Radius of the pulsating sphere (same units as positions).",
+)
 
+# Plane-wave parameters
+W = st.sidebar.number_input(
+    "W (plane-wave multiplier)",
+    min_value=1.0,
+    value=500.0,
+    step=1.0,
+    help="Scaling factor before rounding (p,q,r) = round(W * unit_direction).",
+)
 
-def build_V_diagonal(pqr: np.ndarray) -> np.ndarray:
-    """
-    Build V_k diagonal entries from plane-wave directions.
+mode_lambda = st.sidebar.selectbox(
+    "How to choose wavelength λ",
+    [
+        "Specify λ directly",
+        "Compute λ from ka=1 (pulsating sphere theory)",
+    ],
+)
 
-    Per your description: V-functions are built from the
-    inverse cosines of the vectors defining the plane waves.
-
-    Implementation here:
-      - For each (p,q,r) form a unit direction u = (ux,uy,uz).
-      - Compute theta_x = arccos(ux), theta_y = arccos(uy), theta_z = arccos(uz).
-      - Define scalar V_k = (theta_x + theta_y + theta_z)/3.
-
-    If you prefer a different combination (e.g. using only one component),
-    you can modify this function.
-    """
-    pqr_f = pqr.astype(np.float64)
-    norms = np.linalg.norm(pqr_f, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-12)
-    u = pqr_f / norms  # direction cosines
-
-    ux = np.clip(u[:, 0], -1.0, 1.0)
-    uy = np.clip(u[:, 1], -1.0, 1.0)
-    uz = np.clip(u[:, 2], -1.0, 1.0)
-
-    theta_x = np.arccos(ux)
-    theta_y = np.arccos(uy)
-    theta_z = np.arccos(uz)
-
-    V = (theta_x + theta_y + theta_z) / 3.0  # shape (K,)
-    return V.astype(np.float64)
-
-
-def compute_pressure_phase2(config: Phase2Config,
-                            geom: Geometry,
-                            pqr_set: PlaneWaveSet) -> Dict[str, np.ndarray]:
-    """
-    Compute surface pressure using the DAM 1.1 Phase II operator:
-
-      A_x = (1/N) * diag(V) * diag(Λ^{-1}) * (g^H v_x)
-      A_y = ...
-      A_z = ...
-      p = g(A_x + A_y + A_z)
-
-    Returns dict containing:
-      - "p": complex128 (N,) pressures
-      - "p_real", "p_imag", "p_mag", "p_phase": float64 (N,)
-      - "Lambda": float64 (K,) diagonal of g^H g / N
-      - "V": float64 (K,) diagonal entries
-    """
-    positions = geom.positions
-    velocities = geom.velocities
-    N = positions.shape[0]
-
-    if N != config.N and config.N > 0:
-        print(f"Warning: config.N={config.N} but file has N={N}; proceeding with N={N}.")
-        config.N = N
-
-    # Build g
-    g = build_g(positions, pqr_set.pqr, config.W, config.lambda_)
-
-    # Column norms Λ = diag(g^H g)/N
-    Lambda = (g.conj().T @ g).diagonal().real / N
-    Lambda_inv = 1.0 / np.maximum(Lambda, 1e-12)
-
-    # Build V from plane-wave directions
-    V = build_V_diagonal(pqr_set.pqr)  # shape (K,)
-
-    # Pressure accumulation
-    p_total = np.zeros(N, dtype=np.complex128)
-    for comp in range(3):
-        vcomp = velocities[:, comp]
-        proj = g.conj().T @ vcomp                 # (K,)
-        A = (1.0 / N) * V * Lambda_inv * proj     # diag(V) * Λ^{-1} * g^H v
-        p_total += g @ A                          # g A
-
-    p = p_total
-    p_real = p.real
-    p_imag = p.imag
-    p_mag = np.abs(p)
-    p_phase = np.angle(p)
-
-    return {
-        "p": p,
-        "p_real": p_real,
-        "p_imag": p_imag,
-        "p_mag": p_mag,
-        "p_phase": p_phase,
-        "Lambda": Lambda,
-        "V": V,
-    }
-
-
-# -----------------------------
-# Output utilities
-# -----------------------------
-
-def pressure_to_dataframe(geom: Geometry,
-                         result: Dict[str, np.ndarray]) -> pd.DataFrame:
-    """
-    Build pressure results dataframe with geometry columns.
-    """
-    return pd.DataFrame({
-        "l": geom.positions[:, 0],
-        "m": geom.positions[:, 1],
-        "n": geom.positions[:, 2],
-        "p_real": result["p_real"],
-        "p_imag": result["p_imag"],
-        "p_mag": result["p_mag"],
-        "p_phase": result["p_phase"],
-    })
-
-
-def write_pressure_csv(out_path: str,
-                       geom: Geometry,
-                       result: Dict[str, np.ndarray]) -> None:
-    """
-    Write per-point pressure data to CSV:
-
-      l, m, n,
-      p_real, p_imag, p_mag, p_phase
-    """
-    df = pressure_to_dataframe(geom, result)
-    df.to_csv(out_path, index=False)
-    print(f"Wrote pressure CSV: {out_path}")
-
-
-# -----------------------------
-def running_in_streamlit() -> bool:
-    return get_script_run_ctx() is not None
-
-
-# -----------------------------
-# CLI / Streamlit entry points
-# -----------------------------
-
-def cached_plane_waves(config: Phase2Config) -> PlaneWaveSet:
-    """
-    Streamlit-friendly cache for plane-wave generation.
-    Only uses parameters that affect the plane-wave set.
-    """
-
-    @st.cache_data(show_spinner=False)
-    def _cached(W: float, K: int, axis_avoid_deg: float, cache_dir: str) -> PlaneWaveSet:
-        cfg = Phase2Config(
-            geom_csv="",
-            N=0,
-            W=W,
-            lambda_=1.0,
-            K=K,
-            axis_avoid_deg=axis_avoid_deg,
-            cache_dir=cache_dir,
-        )
-        return generate_pqr(cfg)
-
-    return _cached(config.W, config.K, config.axis_avoid_deg, config.cache_dir)
-
-
-def run_streamlit_app() -> None:
-    st.set_page_config(page_title="DAM 1.1 Phase II", layout="wide")
-    st.title("DAM 1.1 Phase II – Streamlit")
-    st.write(
-        "Upload geometry + velocity data, choose plane-wave parameters, "
-        "and compute pressure fields using the Phase II operator."
+if mode_lambda == "Specify λ directly":
+    lambda_val = st.sidebar.number_input(
+        "λ (wavelength)",
+        min_value=1e-9,
+        value=2.0 * np.pi * radius,  # consistent with ka≈1 for guidance
+        step=1.0,
+        format="%.6f",
+    )
+else:
+    # Enforce ka = 1 with radius
+    # ka = k a = 1 → k = 1/a → λ = 2π / k = 2π a
+    k = 1.0 / radius
+    lambda_val = 2.0 * np.pi / k
+    st.sidebar.markdown(
+        f"Computed from ka = 1 and radius a = {radius:.3f}: "
+        f"λ ≈ {lambda_val:.3f}"
     )
 
-    uploaded_file = st.file_uploader("Geometry & velocity CSV", type="csv")
+# Candidate K values
+default_K = 3 * N
+predefined_Ks = [800, 1600, 2400, 3200, default_K]
+# ensure uniqueness
+predefined_Ks = sorted(set(predefined_Ks))
 
-    geom: Optional[Geometry] = None
-    if uploaded_file is not None:
-        geom = read_geometry_csv(uploaded_file)
-        st.success(
-            f"Loaded {geom.positions.shape[0]} points from "
-            f"{geom.meta.get('source', 'uploaded file')}"
-        )
-        st.dataframe(pd.DataFrame(geom.positions, columns=["l", "m", "n"]).head())
+K = st.sidebar.selectbox(
+    "K (number of plane waves)",
+    options=predefined_Ks,
+    index=predefined_Ks.index(default_K) if default_K in predefined_Ks else len(predefined_Ks) - 1,
+    help="3N is a common default; you can also pick 800,1600,2400,3200.",
+)
 
-    sidebar = st.sidebar
-    sidebar.header("Configuration")
+axis_avoid = st.sidebar.number_input(
+    "Axis avoid angle (deg)",
+    min_value=0.0,
+    max_value=89.9,
+    value=20.0,
+    step=1.0,
+    help="Cone half-angle about coordinate axes to avoid plane waves too close to axes.",
+)
 
-    default_N = geom.positions.shape[0] if geom is not None else 0
-    default_K = 3 * default_N if default_N > 0 else 0
+run_button = st.sidebar.button("Run Phase II computation")
 
-    W = sidebar.number_input("W (integerization multiplier)", value=500.0, min_value=1.0)
-    lambda_ = sidebar.number_input("Wavelength λ", value=1.0, min_value=1e-6, format="%.6f")
-    K = sidebar.number_input(
-        "K (number of plane waves)",
-        min_value=1,
-        value=max(1, default_K),
-        help="Default is 3×N if a file is loaded."
+
+# -----------------------------
+# Generate geometry & show preview
+# -----------------------------
+
+# Generate geometry and radial velocities now so user can see them
+pts, dirs = spherical_fibonacci_points(N, radius)
+l, m, n = pts[:, 0], pts[:, 1], pts[:, 2]
+vx, vy, vz = dirs[:, 0], dirs[:, 1], dirs[:, 2]
+
+df_geom = pd.DataFrame({
+    "l": l,
+    "m": m,
+    "n": n,
+    "vx_real": vx,
+    "vx_imag": np.zeros_like(vx),
+    "vy_real": vy,
+    "vy_imag": np.zeros_like(vy),
+    "vz_real": vz,
+    "vz_imag": np.zeros_like(vz),
+})
+
+st.subheader("Generated geometry and radial velocity (preview)")
+st.write(f"Sphere radius = {radius}, N = {N}")
+st.dataframe(df_geom.head())
+
+# Optional: simple 3D scatter of the geometry
+with st.expander("Show 3D geometry scatter (positions only)"):
+    fig_geo = plt.figure(figsize=(5, 5))
+    axg = fig_geo.add_subplot(111, projection="3d")
+    axg.scatter(l, m, n)
+    axg.set_xlabel("l")
+    axg.set_ylabel("m")
+    axg.set_zlabel("n")
+    axg.set_title("Generated sphere points")
+    max_range = np.array([l.max()-l.min(), m.max()-m.min(), n.max()-n.min()]).max() / 2.0
+    mid_x = 0.5 * (l.max() + l.min())
+    mid_y = 0.5 * (m.max() + m.min())
+    mid_z = 0.5 * (n.max() + n.min())
+    axg.set_xlim(mid_x - max_range, mid_x + max_range)
+    axg.set_ylim(mid_y - max_range, mid_y + max_range)
+    axg.set_zlim(mid_z - max_range, mid_z + max_range)
+    st.pyplot(fig_geo)
+
+
+# -----------------------------
+# Run Phase II
+# -----------------------------
+
+if not run_button:
+    st.stop()
+
+st.info("Running DAM 1.1 Phase II with generated pulsating-sphere data...")
+
+# Build Geometry from DataFrame
+try:
+    geom = geometry_from_dataframe(df_geom)
+except Exception as e:
+    st.error(f"Internal geometry build error: {e}")
+    st.stop()
+
+config = Phase2Config(
+    N=N,
+    W=W,
+    lambda_=lambda_val,
+    K=K,
+    axis_avoid_deg=axis_avoid,
+)
+
+with st.spinner("Generating plane waves and computing pressure..."):
+    pqr_set = generate_pqr(config)
+    result = compute_pressure_phase2(config, geom, pqr_set)
+
+st.success("Computation complete.")
+
+
+# -----------------------------
+# Summary
+# -----------------------------
+
+st.subheader("Configuration summary")
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.write(f"N = {geom.positions.shape[0]}")
+    st.write(f"Radius a = {radius:.6g}")
+with col2:
+    st.write(f"K = {config.K}")
+    st.write(f"W = {config.W}")
+with col3:
+    st.write(f"λ = {config.lambda_:.6g}")
+    st.write(f"Axis avoid = {config.axis_avoid_deg}°")
+
+st.write(f"Plane-wave octant counts = {pqr_set.octant_counts}")
+
+Lambda = result["Lambda"]
+st.write(
+    f"Λ diag stats: min = {Lambda.min():.6g}, "
+    f"max = {Lambda.max():.6g}, "
+    f"mean = {Lambda.mean():.6g}"
+)
+
+
+# -----------------------------
+# Pressure table and download
+# -----------------------------
+
+st.subheader("Pressure results (first 10 points)")
+
+out_df = pd.DataFrame({
+    "l": geom.positions[:, 0],
+    "m": geom.positions[:, 1],
+    "n": geom.positions[:, 2],
+    "p_real": result["p_real"],
+    "p_imag": result["p_imag"],
+    "p_mag": result["p_mag"],
+    "p_phase": result["p_phase"],
+})
+
+st.dataframe(out_df.head(10))
+
+csv_bytes = out_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="Download full pressure CSV",
+    data=csv_bytes,
+    file_name="phase2_pulsating_sphere_pressures.csv",
+    mime="text/csv",
+)
+
+
+# -----------------------------
+# Visualization of |p|
+# -----------------------------
+
+st.subheader("|p| distribution (3D scatter)")
+
+fig = plt.figure(figsize=(5, 5))
+ax = fig.add_subplot(111, projection="3d")
+pos = geom.positions
+p_mag = result["p_mag"]
+
+size_min = 10.0
+size_max = 80.0
+if p_mag.max() > 0:
+    sizes = size_min + (size_max - size_min) * (p_mag - p_mag.min()) / max(
+        p_mag.max() - p_mag.min(), 1e-12
     )
-    axis_avoid = sidebar.slider("Axis avoidance (degrees)", 0.0, 90.0, 20.0)
-    cache_dir = sidebar.text_input("Cache directory", value=".dam_cache")
+else:
+    sizes = np.full_like(p_mag, size_min)
 
-    compute = sidebar.button("Compute pressure", disabled=geom is None)
+ax.scatter(pos[:, 0], pos[:, 1], pos[:, 2], s=sizes)
+ax.set_xlabel("l")
+ax.set_ylabel("m")
+ax.set_zlabel("n")
+ax.set_title("|p| on pulsating sphere")
+ax.set_box_aspect([1, 1, 1])
 
-    if compute and geom is None:
-        st.error("Please upload a geometry CSV to continue.")
-
-    if compute and geom is not None:
-        cfg = Phase2Config(
-            geom_csv=geom.meta.get("source", "uploaded.csv"),
-            N=geom.positions.shape[0],
-            W=W,
-            lambda_=lambda_,
-            K=int(K),
-            axis_avoid_deg=axis_avoid,
-            cache_dir=cache_dir,
-        )
-
-        with st.spinner("Generating plane waves..."):
-            pqr_set = cached_plane_waves(cfg)
-
-        st.info(f"Using K={cfg.K} plane waves; octant balance: {pqr_set.octant_counts}")
-
-        with st.spinner("Computing pressure field..."):
-            result = compute_pressure_phase2(cfg, geom, pqr_set)
-
-        Lambda = result["Lambda"]
-        st.metric("Λ min / max / mean", f"{Lambda.min():.3g} / {Lambda.max():.3g} / {Lambda.mean():.3g}")
-
-        df = pressure_to_dataframe(geom, result)
-        st.dataframe(df.head())
-
-        csv_data = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download pressure CSV",
-            csv_data,
-            file_name="dam11_phase2_pressures.csv",
-            mime="text/csv",
-        )
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="DAM 1.1 Phase II pressure calculation for a digitized radiator."
-    )
-    parser.add_argument("--geom", required=True,
-                        help="Geometry + velocity CSV file.")
-    parser.add_argument("--N", type=int, required=True,
-                        help="Number of points (sanity check).")
-    parser.add_argument("--W", type=float, required=True,
-                        help="Multiplier W for plane-wave integerization.")
-    parser.add_argument("--lambda", dest="lambda_", type=float, required=True,
-                        help="Wavelength lambda.")
-    parser.add_argument("--K", type=int, default=None,
-                        help="Number of plane waves; defaults to 3*N.")
-    parser.add_argument("--axis-avoid", type=float, default=20.0,
-                        help="Axis avoidance half-angle in degrees (default 20).")
-    parser.add_argument("--cache-dir", type=str, default=".dam_cache",
-                        help="Directory to cache plane-wave sets.")
-    parser.add_argument("--out-csv", type=str, default="dam11_phase2_pressures.csv",
-                        help="Output CSV for pressure results.")
-    parser.add_argument("--precompute-pqrs", action="store_true",
-                        help="Precompute cached pqr sets for K=800,1600,2400,3200 and exit.")
-
-    args = parser.parse_args()
-
-    if args.precompute_pqrs:
-        precompute_default_pqrs(W=args.W, cache_dir=args.cache_dir)
-        return
-
-    # Build config
-    K = args.K if args.K is not None else 3 * args.N
-    cfg = Phase2Config(
-        geom_csv=args.geom,
-        N=args.N,
-        W=args.W,
-        lambda_=args.lambda_,
-        K=K,
-        axis_avoid_deg=args.axis_avoid,
-        cache_dir=args.cache_dir,
-    )
-
-    # Read geometry/velocities
-    geom = read_geometry_csv(cfg.geom_csv)
-    print(f"Read geometry from {cfg.geom_csv}: N={geom.positions.shape[0]}")
-
-    # Generate or load plane waves
-    pqr_set = generate_pqr(cfg)
-    print(f"Using plane waves: K={cfg.K}, octant_counts={pqr_set.octant_counts}")
-
-    # Compute pressure
-    result = compute_pressure_phase2(cfg, geom, pqr_set)
-    print(f"Lambda diag stats: min={result['Lambda'].min():.6g}, "
-          f"max={result['Lambda'].max():.6g}, "
-          f"mean={result['Lambda'].mean():.6g}")
-
-    # Write outputs
-    write_pressure_csv(args.out_csv, geom, result)
-
-    # Optional: show simple global summary
-    p = result["p"]
-    print(f"Global mean p (Re, Im): ({p.real.mean():.6g}, {p.imag.mean():.6g})")
-    print(f"Global mean |p|: {np.abs(p).mean():.6g}")
-
-
-if __name__ == "__main__":
-    if running_in_streamlit():
-        run_streamlit_app()
-    else:
-        main()
+st.pyplot(fig)
