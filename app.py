@@ -33,10 +33,12 @@ import os
 import math
 import argparse
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, IO, Optional, Tuple, List, Union
 
 import numpy as np
 import pandas as pd
+import streamlit as st
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 
 # -----------------------------
@@ -71,7 +73,7 @@ class PlaneWaveSet:
 # Geometry & velocity reader
 # -----------------------------
 
-def read_geometry_csv(path: str) -> Geometry:
+def read_geometry_csv(path: Union[str, IO[str]]) -> Geometry:
     """
     Read geometry + velocities from CSV.
 
@@ -104,8 +106,9 @@ def read_geometry_csv(path: str) -> Geometry:
     vz = df["vz_real"].to_numpy(dtype=float) + 1j * df["vz_imag"].to_numpy(dtype=float)
     velocities = np.column_stack([vx, vy, vz]).astype(np.complex128)
 
+    source_name = path if isinstance(path, str) else getattr(path, "name", None)
     meta = {
-        "source": os.path.basename(path),
+        "source": os.path.basename(source_name) if source_name else "uploaded.csv",
         "units_length": "arbitrary",
         "units_velocity": "arbitrary",
     }
@@ -399,6 +402,22 @@ def compute_pressure_phase2(config: Phase2Config,
 # Output utilities
 # -----------------------------
 
+def pressure_to_dataframe(geom: Geometry,
+                         result: Dict[str, np.ndarray]) -> pd.DataFrame:
+    """
+    Build pressure results dataframe with geometry columns.
+    """
+    return pd.DataFrame({
+        "l": geom.positions[:, 0],
+        "m": geom.positions[:, 1],
+        "n": geom.positions[:, 2],
+        "p_real": result["p_real"],
+        "p_imag": result["p_imag"],
+        "p_mag": result["p_mag"],
+        "p_phase": result["p_phase"],
+    })
+
+
 def write_pressure_csv(out_path: str,
                        geom: Geometry,
                        result: Dict[str, np.ndarray]) -> None:
@@ -408,22 +427,116 @@ def write_pressure_csv(out_path: str,
       l, m, n,
       p_real, p_imag, p_mag, p_phase
     """
-    df = pd.DataFrame({
-        "l": geom.positions[:, 0],
-        "m": geom.positions[:, 1],
-        "n": geom.positions[:, 2],
-        "p_real": result["p_real"],
-        "p_imag": result["p_imag"],
-        "p_mag": result["p_mag"],
-        "p_phase": result["p_phase"],
-    })
+    df = pressure_to_dataframe(geom, result)
     df.to_csv(out_path, index=False)
     print(f"Wrote pressure CSV: {out_path}")
 
 
 # -----------------------------
-# CLI
+def running_in_streamlit() -> bool:
+    return get_script_run_ctx() is not None
+
+
 # -----------------------------
+# CLI / Streamlit entry points
+# -----------------------------
+
+def cached_plane_waves(config: Phase2Config) -> PlaneWaveSet:
+    """
+    Streamlit-friendly cache for plane-wave generation.
+    Only uses parameters that affect the plane-wave set.
+    """
+
+    @st.cache_data(show_spinner=False)
+    def _cached(W: float, K: int, axis_avoid_deg: float, cache_dir: str) -> PlaneWaveSet:
+        cfg = Phase2Config(
+            geom_csv="",
+            N=0,
+            W=W,
+            lambda_=1.0,
+            K=K,
+            axis_avoid_deg=axis_avoid_deg,
+            cache_dir=cache_dir,
+        )
+        return generate_pqr(cfg)
+
+    return _cached(config.W, config.K, config.axis_avoid_deg, config.cache_dir)
+
+
+def run_streamlit_app() -> None:
+    st.set_page_config(page_title="DAM 1.1 Phase II", layout="wide")
+    st.title("DAM 1.1 Phase II – Streamlit")
+    st.write(
+        "Upload geometry + velocity data, choose plane-wave parameters, "
+        "and compute pressure fields using the Phase II operator."
+    )
+
+    uploaded_file = st.file_uploader("Geometry & velocity CSV", type="csv")
+
+    geom: Optional[Geometry] = None
+    if uploaded_file is not None:
+        geom = read_geometry_csv(uploaded_file)
+        st.success(
+            f"Loaded {geom.positions.shape[0]} points from "
+            f"{geom.meta.get('source', 'uploaded file')}"
+        )
+        st.dataframe(pd.DataFrame(geom.positions, columns=["l", "m", "n"]).head())
+
+    sidebar = st.sidebar
+    sidebar.header("Configuration")
+
+    default_N = geom.positions.shape[0] if geom is not None else 0
+    default_K = 3 * default_N if default_N > 0 else 0
+
+    W = sidebar.number_input("W (integerization multiplier)", value=500.0, min_value=1.0)
+    lambda_ = sidebar.number_input("Wavelength λ", value=1.0, min_value=1e-6, format="%.6f")
+    K = sidebar.number_input(
+        "K (number of plane waves)",
+        min_value=1,
+        value=max(1, default_K),
+        help="Default is 3×N if a file is loaded."
+    )
+    axis_avoid = sidebar.slider("Axis avoidance (degrees)", 0.0, 90.0, 20.0)
+    cache_dir = sidebar.text_input("Cache directory", value=".dam_cache")
+
+    compute = sidebar.button("Compute pressure", disabled=geom is None)
+
+    if compute and geom is None:
+        st.error("Please upload a geometry CSV to continue.")
+
+    if compute and geom is not None:
+        cfg = Phase2Config(
+            geom_csv=geom.meta.get("source", "uploaded.csv"),
+            N=geom.positions.shape[0],
+            W=W,
+            lambda_=lambda_,
+            K=int(K),
+            axis_avoid_deg=axis_avoid,
+            cache_dir=cache_dir,
+        )
+
+        with st.spinner("Generating plane waves..."):
+            pqr_set = cached_plane_waves(cfg)
+
+        st.info(f"Using K={cfg.K} plane waves; octant balance: {pqr_set.octant_counts}")
+
+        with st.spinner("Computing pressure field..."):
+            result = compute_pressure_phase2(cfg, geom, pqr_set)
+
+        Lambda = result["Lambda"]
+        st.metric("Λ min / max / mean", f"{Lambda.min():.3g} / {Lambda.max():.3g} / {Lambda.mean():.3g}")
+
+        df = pressure_to_dataframe(geom, result)
+        st.dataframe(df.head())
+
+        csv_data = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download pressure CSV",
+            csv_data,
+            file_name="dam11_phase2_pressures.csv",
+            mime="text/csv",
+        )
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -490,4 +603,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if running_in_streamlit():
+        run_streamlit_app()
+    else:
+        main()
