@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
 from typing import Dict, Tuple, List
@@ -182,16 +186,13 @@ def generate_pqr(config: Phase2Config,
 
 
 # =============================
-# Phase II operator (g, Λ, Vx,Vy,Vz)
+# Phase II operator (g, Λ, V)
 # =============================
 
 def build_g(positions: np.ndarray,
             pqr: np.ndarray,
             W: float,
             lambda_: float) -> np.ndarray:
-    """
-    g[i,k] = exp( j * 2π/(W λ) * (l_i p_k + m_i q_k + n_i r_k) )
-    """
     lmn = positions.astype(np.float64)
     pqr_f = pqr.astype(np.float64)
     scale = 2.0 * np.pi / (W * lambda_)
@@ -201,50 +202,27 @@ def build_g(positions: np.ndarray,
     return g.astype(np.complex128)
 
 
-def build_V_component_from_pqr(pqr: np.ndarray, axis: str) -> np.ndarray:
+def build_V_diagonal(pqr: np.ndarray) -> np.ndarray:
     """
-    Build Vx, Vy, or Vz diagonal entries from integer (p,q,r).
+    Build V_k from inverse cosines of direction cosines of each plane-wave direction.
 
-    Your rule:
-      - Each plane wave is defined by directional cosines (ux,uy,uz)
-        on the unit sphere.
-      - After integerization, p ≈ W*ux, q ≈ W*uy, r ≈ W*uz.
-      - For the x-direction operator:
-            Vx_k ≈ 1 / (W*ux_k) ≈ 1 / p_k
-        similarly:
-            Vy_k ≈ 1 / q_k
-            Vz_k ≈ 1 / r_k
-
-    Inputs
-    ------
-    pqr : (K,3) array of ints/floats
-        Columns are [p, q, r] for each plane wave.
-    axis : {'x','y','z'}
-        Which component to build V for.
-
-    Returns
-    -------
-    V : (K,) float64
-        Diagonal entries for the chosen component.
+    Example scalar:
+      V_k = (arccos(ux) + arccos(uy) + arccos(uz)) / 3
     """
-    pqr = np.asarray(pqr, dtype=np.float64)
-    p = pqr[:, 0]
-    q = pqr[:, 1]
-    r = pqr[:, 2]
+    pqr_f = pqr.astype(np.float64)
+    norms = np.linalg.norm(pqr_f, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-12)
+    u = pqr_f / norms
 
-    eps = 1e-12  # guard against accidental zeros; axis-avoid should already help
+    ux = np.clip(u[:, 0], -1.0, 1.0)
+    uy = np.clip(u[:, 1], -1.0, 1.0)
+    uz = np.clip(u[:, 2], -1.0, 1.0)
 
-    ax = axis.lower()
-    if ax == "x":
-        denom = np.where(np.abs(p) > eps, p, np.sign(p) * eps)
-    elif ax == "y":
-        denom = np.where(np.abs(q) > eps, q, np.sign(q) * eps)
-    elif ax == "z":
-        denom = np.where(np.abs(r) > eps, r, np.sign(r) * eps)
-    else:
-        raise ValueError("axis must be 'x', 'y', or 'z'")
+    theta_x = np.arccos(ux)
+    theta_y = np.arccos(uy)
+    theta_z = np.arccos(uz)
 
-    V = 1.0 / denom
+    V = (theta_x + theta_y + theta_z) / 3.0
     return V.astype(np.float64)
 
 
@@ -252,67 +230,37 @@ def compute_pressure_phase2(config: Phase2Config,
                             geom: Geometry,
                             pqr_set: PlaneWaveSet) -> Dict[str, np.ndarray]:
     """
-    Compute surface pressure using DAM 1.1 Phase II operator, with
-    separate Vx, Vy, Vz diagonals as per your description:
+    Compute surface pressure using DAM 1.1 Phase II operator:
 
-      For each component ξ ∈ {x, y, z}:
-
-        A_ξ = (1/N) * diag(Vξ) * diag(Lambda^{-1}) * (g^H v_ξ)
-
-      where:
-        - Vx_k ≈ 1 / p_k
-        - Vy_k ≈ 1 / q_k
-        - Vz_k ≈ 1 / r_k
-
-      Total pressure:
-        p = g(A_x + A_y + A_z)
+      A_x = (1/N) * diag(V) * diag(Lambda^{-1}) * (g^H v_x)
+      A_y = ...
+      A_z = ...
+      p = g(A_x + A_y + A_z)
 
     Returns fields:
-      p, p_real, p_imag, p_mag, p_phase, Lambda, Vx, Vy, Vz
+      p, p_real, p_imag, p_mag, p_phase, Lambda, V
     """
     positions = geom.positions
     velocities = geom.velocities
     N = positions.shape[0]
 
-    # Keep config.N in sync, but don't enforce it as a constraint
     if N != config.N:
         config.N = N
 
-    # Build g-matrix, shape (N,K)
     g = build_g(positions, pqr_set.pqr, config.W, config.lambda_)
-
-    # Column norms Λ = diag(g^H g) / N
     Lambda = (g.conj().T @ g).diagonal().real / N
     Lambda_inv = 1.0 / np.maximum(Lambda, 1e-12)
 
-    # Build component-specific V diagonals from integer (p,q,r)
-    Vx = build_V_component_from_pqr(pqr_set.pqr, axis="x")
-    Vy = build_V_component_from_pqr(pqr_set.pqr, axis="y")
-    Vz = build_V_component_from_pqr(pqr_set.pqr, axis="z")
+    V = build_V_diagonal(pqr_set.pqr)
 
-    # Accumulate contribution from x, y, z velocity components
     p_total = np.zeros(N, dtype=np.complex128)
-
-    # Px: use only Vx for vx
-    vx = velocities[:, 0]            # (N,)
-    proj_x = g.conj().T @ vx         # (K,)
-    A_x = (1.0 / N) * Vx * Lambda_inv * proj_x
-    p_total += g @ A_x               # (N,)
-
-    # Py: use only Vy for vy
-    vy = velocities[:, 1]
-    proj_y = g.conj().T @ vy
-    A_y = (1.0 / N) * Vy * Lambda_inv * proj_y
-    p_total += g @ A_y
-
-    # Pz: use only Vz for vz
-    vz = velocities[:, 2]
-    proj_z = g.conj().T @ vz
-    A_z = (1.0 / N) * Vz * Lambda_inv * proj_z
-    p_total += g @ A_z
+    for comp in range(3):
+        vcomp = velocities[:, comp]
+        proj = g.conj().T @ vcomp
+        A = (1.0 / N) * V * Lambda_inv * proj
+        p_total += g @ A
 
     p = p_total
-
     return {
         "p": p,
         "p_real": p.real,
@@ -320,53 +268,8 @@ def compute_pressure_phase2(config: Phase2Config,
         "p_mag": np.abs(p),
         "p_phase": np.angle(p),
         "Lambda": Lambda,
-        "Vx": Vx,
-        "Vy": Vy,
-        "Vz": Vz,
+        "V": V,
     }
-
-
-# =============================
-# Diagnostics (octant-wise)
-# =============================
-
-def octant_index_from_positions(positions: np.ndarray) -> np.ndarray:
-    """
-    Map surface points to octant indices 0..7 based on signs of (l,m,n).
-    """
-    s = (positions >= 0.0).astype(int)
-    return (s[:, 0] << 2) + (s[:, 1] << 1) + s[:, 2]
-
-
-def compute_octant_stats(positions: np.ndarray,
-                         p: np.ndarray) -> pd.DataFrame:
-    """
-    Compute per-octant mean/STD of Re(p), Im(p), |p|.
-
-    Returns a DataFrame with columns:
-      Octant, Count, Re_mean, Im_mean, Mag_mean, Re_std, Im_std, Mag_std
-    """
-    oct_idx = octant_index_from_positions(positions)
-    rows = []
-    for o in range(8):
-        mask = (oct_idx == o)
-        if not mask.any():
-            continue
-        p_o = p[mask]
-        Re = p_o.real
-        Im = p_o.imag
-        Mag = np.abs(p_o)
-        rows.append({
-            "Octant": o,
-            "Count": int(mask.sum()),
-            "Re_mean": float(Re.mean()),
-            "Im_mean": float(Im.mean()),
-            "Mag_mean": float(Mag.mean()),
-            "Re_std": float(Re.std(ddof=1)) if mask.sum() > 1 else 0.0,
-            "Im_std": float(Im.std(ddof=1)) if mask.sum() > 1 else 0.0,
-            "Mag_std": float(Mag.std(ddof=1)) if mask.sum() > 1 else 0.0,
-        })
-    return pd.DataFrame(rows)
 
 
 # =============================
@@ -428,3 +331,171 @@ mode_lambda = st.sidebar.selectbox(
         "Compute λ from ka=1 (pulsating sphere theory)",
     ],
 )
+
+if mode_lambda == "Specify λ directly":
+    lambda_val = st.sidebar.number_input(
+        "λ (wavelength)",
+        min_value=1e-9,
+        value=2.0 * math.pi * radius,
+        step=1.0,
+        format="%.6f",
+    )
+else:
+    # ka = 1 → k = 1/a → λ = 2πa
+    k = 1.0 / radius
+    lambda_val = 2.0 * math.pi / k
+    st.sidebar.markdown(
+        f"Computed from ka = 1 and radius a = {radius:.3f}: "
+        f"λ ≈ {lambda_val:.3f}"
+    )
+
+default_K = 3 * N
+predefined_Ks = sorted(set([800, 1600, 2400, 3200, default_K]))
+K = st.sidebar.selectbox(
+    "K (number of plane waves)",
+    options=predefined_Ks,
+    index=predefined_Ks.index(default_K) if default_K in predefined_Ks else len(predefined_Ks) - 1,
+    help="3N is a common default; other choices are 800,1600,2400,3200.",
+)
+
+axis_avoid = st.sidebar.number_input(
+    "Axis avoid angle (deg)",
+    min_value=0.0,
+    max_value=89.9,
+    value=20.0,
+    step=1.0,
+    help="Cone half-angle about coordinate axes to avoid plane waves close to axes.",
+)
+
+run_button = st.sidebar.button("Run Phase II computation")
+
+
+# Generate geometry preview
+pts, dirs = spherical_fibonacci_points(N, radius)
+l, m, n = pts[:, 0], pts[:, 1], pts[:, 2]
+
+df_geom_preview = pd.DataFrame({
+    "l": l,
+    "m": m,
+    "n": n,
+    "vx": dirs[:, 0],
+    "vy": dirs[:, 1],
+    "vz": dirs[:, 2],
+})
+
+st.subheader("Generated geometry and radial velocity (preview)")
+st.write(f"Sphere radius = {radius}, N = {N}")
+st.dataframe(df_geom_preview.head())
+
+with st.expander("Show 3D geometry scatter (positions only)"):
+    fig_geo = plt.figure(figsize=(5, 5))
+    axg = fig_geo.add_subplot(111, projection="3d")
+    axg.scatter(l, m, n)
+    axg.set_xlabel("l")
+    axg.set_ylabel("m")
+    axg.set_zlabel("n")
+    axg.set_title("Generated sphere points")
+    max_range = np.array([l.max()-l.min(), m.max()-m.min(), n.max()-n.min()]).max() / 2.0
+    mid_x = 0.5 * (l.max() + l.min())
+    mid_y = 0.5 * (m.max() + m.min())
+    mid_z = 0.5 * (n.max() + n.min())
+    axg.set_xlim(mid_x - max_range, mid_x + max_range)
+    axg.set_ylim(mid_y - max_range, mid_y + max_range)
+    axg.set_zlim(mid_z - max_range, mid_z + max_range)
+    st.pyplot(fig_geo)
+
+
+if not run_button:
+    st.stop()
+
+st.info("Running DAM 1.1 Phase II with generated pulsating-sphere data...")
+
+geom = build_geometry_from_sphere(N, radius)
+config = Phase2Config(
+    N=N,
+    W=W,
+    lambda_=lambda_val,
+    K=K,
+    axis_avoid_deg=axis_avoid,
+)
+
+with st.spinner("Generating plane waves and computing pressure..."):
+    pqr_set = generate_pqr(config)
+    result = compute_pressure_phase2(config, geom, pqr_set)
+
+st.success("Computation complete.")
+
+
+# Summary
+st.subheader("Configuration summary")
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.write(f"N = {geom.positions.shape[0]}")
+    st.write(f"Radius a = {radius:.6g}")
+with col2:
+    st.write(f"K = {config.K}")
+    st.write(f"W = {config.W}")
+with col3:
+    st.write(f"λ = {config.lambda_:.6g}")
+    st.write(f"Axis avoid = {config.axis_avoid_deg}°")
+
+st.write(f"Plane-wave octant counts = {pqr_set.octant_counts}")
+
+Lambda = result["Lambda"]
+st.write(
+    f"Λ diag stats: min = {Lambda.min():.6g}, "
+    f"max = {Lambda.max():.6g}, "
+    f"mean = {Lambda.mean():.6g}"
+)
+
+
+# Pressure table and download
+st.subheader("Pressure results (first 10 points)")
+
+out_df = pd.DataFrame({
+    "l": geom.positions[:, 0],
+    "m": geom.positions[:, 1],
+    "n": geom.positions[:, 2],
+    "p_real": result["p_real"],
+    "p_imag": result["p_imag"],
+    "p_mag": result["p_mag"],
+    "p_phase": result["p_phase"],
+})
+
+st.dataframe(out_df.head(10))
+
+csv_bytes = out_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="Download full pressure CSV",
+    data=csv_bytes,
+    file_name="phase2_pulsating_sphere_pressures.csv",
+    mime="text/csv",
+)
+
+
+# Visualization of |p|
+st.subheader("|p| distribution (3D scatter)")
+
+fig = plt.figure(figsize=(5, 5))
+ax = fig.add_subplot(111, projection="3d")
+pos = geom.positions
+p_mag = result["p_mag"]
+
+size_min = 10.0
+size_max = 80.0
+if p_mag.max() > 0:
+    sizes = size_min + (size_max - size_min) * (p_mag - p_mag.min()) / max(
+        p_mag.max() - p_mag.min(), 1e-12
+    )
+else:
+    sizes = np.full_like(p_mag, size_min)
+
+ax.scatter(pos[:, 0], pos[:, 1], pos[:, 2], s=sizes)
+ax.set_xlabel("l")
+ax.set_ylabel("m")
+ax.set_zlabel("n")
+ax.set_title("|p| on pulsating sphere")
+ax.set_box_aspect([1, 1, 1])
+
+st.pyplot(fig)
