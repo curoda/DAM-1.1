@@ -42,151 +42,206 @@ class PlaneWaveSet:
 # Pulsating sphere geometry
 # =============================
 
-def spherical_fibonacci_points(N: int, radius: float):
+def spherical_fibonacci_points(M: int, radius: float = 1.0) -> np.ndarray:
     """
-    Generate N points on a sphere of given radius using the spherical
-    Fibonacci method, plus associated unit radial directions.
-
-    Returns:
-      pts  : (N,3) positions [l,m,n]
-      dirs : (N,3) unit radial vectors (radial directions)
+    Generate M approximately uniform points on a sphere of given radius
+    using the spherical Fibonacci / golden-angle method.
+    Returns array of shape (M,3) with x,y,z coordinates.
     """
-    i = np.arange(N, dtype=np.float64)
-    phi = (1.0 + np.sqrt(5.0)) / 2.0
-    ga = 2.0 * np.pi * (1.0 - 1.0 / phi)
+    # Standard spherical Fibonacci construction
+    k = np.arange(M, dtype=np.float64)
+    phi = (1 + 5 ** 0.5) / 2  # golden ratio
+    ga = 2.0 * np.pi / phi
 
-    z = 1.0 - 2.0 * (i + 0.5) / N
-    r = np.sqrt(np.maximum(0.0, 1.0 - z * z))
-    theta = ga * i
+    z = 1.0 - (2.0 * k + 1.0) / M
+    r = np.sqrt(np.maximum(1.0 - z * z, 0.0))
+    theta = ga * k
 
     x = r * np.cos(theta)
     y = r * np.sin(theta)
 
-    pts_unit = np.stack([x, y, z], axis=1)
-    pts_unit /= np.linalg.norm(pts_unit, axis=1, keepdims=True)
-
-    pts = radius * pts_unit
-    return pts, pts_unit
+    pts = np.stack([x, y, z], axis=1)
+    pts *= float(radius)
+    return pts
 
 
-def build_geometry_from_sphere(N: int, radius: float) -> Geometry:
+def build_geometry_from_sphere(N: int, radius: float = 100.0) -> Geometry:
     """
-    Convenience: build Geometry for a pulsating sphere with
-    unit radial velocity at each point.
+    Build Geometry for pulsating sphere:
+      - N nearly-uniform points on radius=radius sphere
+      - integerised positions (rounded)
+      - velocities = unit radial directions (complex128)
     """
-    pts, dirs = spherical_fibonacci_points(N, radius)
+    dirs = spherical_fibonacci_points(N, radius=1.0)
+    # Integerised positions at radius
+    pos_cont = dirs * radius
+    lmn_int = np.rint(pos_cont).astype(np.float64)
+
+    # Unit radial velocities (same as radius=1 points)
     vx, vy, vz = dirs[:, 0], dirs[:, 1], dirs[:, 2]
-
     velocities = np.column_stack([vx, vy, vz]).astype(np.complex128)
-    positions = pts.astype(np.float64)
 
-    meta: Dict[str, object] = {
-        "units_length": "arbitrary",
-        "units_velocity": "arbitrary",
+    meta = {
         "radius": radius,
+        "dirs_unit": dirs,
     }
-    return Geometry(positions=positions, velocities=velocities, meta=meta)
+
+    return Geometry(positions=lmn_int, velocities=velocities, meta=meta)
 
 
 # =============================
-# Plane-wave utilities
+# Plane-wave / pqr generation
 # =============================
 
-def spherical_fibonacci(n: int) -> np.ndarray:
-    i = np.arange(n, dtype=np.float64)
-    phi = (1 + 5**0.5) / 2.0
-    ga = 2.0 * np.pi * (1.0 - 1.0 / phi)
-    z = 1.0 - 2.0 * (i + 0.5) / n
-    r = np.sqrt(np.maximum(0.0, 1.0 - z*z))
-    theta = ga * i
-    x = r * np.cos(theta)
-    y = r * np.sin(theta)
-    u = np.stack([x, y, z], axis=1)
-    u /= np.linalg.norm(u, axis=1, keepdims=True)
-    return u
-
-
-def within_axis_cone(u: np.ndarray, deg: float) -> np.ndarray:
-    if deg <= 0:
-        return np.ones(len(u), dtype=bool)
-    cos_thr = np.cos(np.deg2rad(deg))
-    ux, uy, uz = np.abs(u[:, 0]), np.abs(u[:, 1]), np.abs(u[:, 2])
-    bad = (ux >= cos_thr) | (uy >= cos_thr) | (uz >= cos_thr)
-    return ~bad
-
-
-def octant_index(v: np.ndarray) -> np.ndarray:
-    s = (v >= 0).astype(np.int32)
-    return (s[:, 0] << 2) + (s[:, 1] << 1) + s[:, 2]
-
-
-def dedupe_triplets(pqr: np.ndarray) -> np.ndarray:
-    if len(pqr) == 0:
-        return pqr
-    a = np.ascontiguousarray(pqr, dtype=np.int32)
-    b = a.view([("p", np.int32), ("q", np.int32), ("r", np.int32)])
-    _, idx = np.unique(b, return_index=True)
-    return a[np.sort(idx)]
-
-
-def forbid_mirrors(pqr: np.ndarray) -> np.ndarray:
-    if len(pqr) == 0:
-        return pqr
-    a = np.ascontiguousarray(pqr, dtype=np.int32)
-    seen = set()
-    keep_idx: List[int] = []
-    for i, (p, q, r) in enumerate(a):
-        if (p, q, r) >= (-p, -q, -r):
-            key = (p, q, r)
-        else:
-            key = (-p, -q, -r)
-        if key in seen:
-            continue
-        seen.add(key)
-        keep_idx.append(i)
-    return a[np.array(keep_idx, dtype=np.int64)]
-
-
-def generate_pqr(config: Phase2Config,
-                 n_unit_dirs: int = 10000) -> PlaneWaveSet:
+def spherical_coordinates_from_cartesian(x: np.ndarray,
+                                         y: np.ndarray,
+                                         z: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Generate plane-wave integer directions (p,q,r) for given W, K.
-
-    Uses spherical Fibonacci unit vectors, axis avoidance, duplicate and
-    mirror removal, then simple octant balancing.
+    Convert Cartesian (x,y,z) to spherical (theta, phi):
+      theta: polar angle [0,pi]
+      phi: azimuthal angle [-pi,pi]
     """
-    u = spherical_fibonacci(n_unit_dirs)
-    u = u[within_axis_cone(u, config.axis_avoid_deg)]
+    r = np.sqrt(x * x + y * y + z * z)
+    r = np.maximum(r, 1e-12)
+    theta = np.arccos(np.clip(z / r, -1.0, 1.0))
+    phi = np.arctan2(y, x)
+    return theta, phi
 
-    pqr = np.rint(config.W * u).astype(np.int32)
-    pqr = pqr[np.any(pqr != 0, axis=1)]
-    pqr = dedupe_triplets(pqr)
-    pqr = forbid_mirrors(pqr)
 
-    oct_idx = octant_index(pqr)
-    counts = np.zeros(8, dtype=int)
-    selected: List[np.ndarray] = []
-    target = (config.K + 7) // 8
-    for i, v in enumerate(pqr):
-        o = oct_idx[i]
-        if counts[o] < target:
-            selected.append(v)
-            counts[o] += 1
-            if len(selected) == config.K:
-                break
-    if len(selected) < config.K:
-        for v in pqr:
-            if len(selected) == config.K:
-                break
-            selected.append(v)
-    pqr_sel = np.array(selected[:config.K], dtype=np.int32)
+def cartesian_from_spherical(theta: np.ndarray,
+                             phi: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Convert spherical (theta, phi) to Cartesian direction cosines (x,y,z) with r=1.
+    """
+    sin_t = np.sin(theta)
+    x = sin_t * np.cos(phi)
+    y = sin_t * np.sin(phi)
+    z = np.cos(theta)
+    return x, y, z
 
-    oct_counts = tuple(np.bincount(octant_index(pqr_sel), minlength=8).tolist())
-    return PlaneWaveSet(pqr=pqr_sel, octant_counts=oct_counts)
+
+def generate_plane_wave_directions(K: int,
+                                   axis_avoid_deg: float = 20.0) -> np.ndarray:
+    """
+    Generate K unit-vector plane-wave directions approximately uniformly over the sphere,
+    with axis-avoidance around +/- x,y,z of given half-angle in degrees.
+
+    Returns array of shape (K,3) of floats [ux,uy,uz].
+    """
+    # Use an oversampled Fibonacci set, then filter and pick K directions
+    oversample_factor = 6
+    M = max(K * oversample_factor, K + 64)
+    dirs = spherical_fibonacci_points(M, radius=1.0)
+    x, y, z = dirs[:, 0], dirs[:, 1], dirs[:, 2]
+
+    # Axis-avoidance: reject directions within axis_avoid_deg of +/- x,y,z
+    axis_avoid_rad = np.deg2rad(axis_avoid_deg)
+    cos_avoid = np.cos(axis_avoid_rad)
+    keep_mask = (
+        (np.abs(x) < cos_avoid) &
+        (np.abs(y) < cos_avoid) &
+        (np.abs(z) < cos_avoid)
+    )
+    dirs_kept = dirs[keep_mask]
+
+    if dirs_kept.shape[0] < K:
+        # If we rejected too many, relax criterion slightly
+        axis_avoid_rad = np.deg2rad(axis_avoid_deg * 0.8)
+        cos_avoid = np.cos(axis_avoid_rad)
+        keep_mask = (
+            (np.abs(x) < cos_avoid) &
+            (np.abs(y) < cos_avoid) &
+            (np.abs(z) < cos_avoid)
+        )
+        dirs_kept = dirs[keep_mask]
+
+    if dirs_kept.shape[0] < K:
+        raise RuntimeError(
+            f"Unable to generate {K} axis-avoiding directions; only {dirs_kept.shape[0]} candidates."
+        )
+
+    # For simplicity: just take first K after filtering
+    dirs_sel = dirs_kept[:K]
+    return dirs_sel
+
+
+def octant_index(vecs: np.ndarray) -> np.ndarray:
+    """
+    Compute octant index 0..7 for each row of vecs shaped (K,3).
+    Octant coding:
+      bit0: x>=0
+      bit1: y>=0
+      bit2: z>=0
+    """
+    x_pos = vecs[:, 0] >= 0
+    y_pos = vecs[:, 1] >= 0
+    z_pos = vecs[:, 2] >= 0
+    return (x_pos.astype(int)
+            + 2 * y_pos.astype(int)
+            + 4 * z_pos.astype(int))
+
+
+def balance_octants(dirs: np.ndarray, K: int) -> np.ndarray:
+    """
+    Given candidate directions dirs (M,3), pick K with balanced octant counts
+    as much as possible.
+    """
+    if dirs.shape[0] <= K:
+        return dirs
+
+    octs = octant_index(dirs)
+    # desired per-octant count (roughly)
+    base = K // 8
+    remainder = K % 8
+    desired = np.array([base + (1 if i < remainder else 0) for i in range(8)], dtype=int)
+
+    selected_indices: List[int] = []
+    used_per_oct = np.zeros(8, dtype=int)
+
+    for i in range(dirs.shape[0]):
+        o = octs[i]
+        if used_per_oct[o] < desired[o]:
+            selected_indices.append(i)
+            used_per_oct[o] += 1
+        if len(selected_indices) == K:
+            break
+
+    # If we didn't hit exactly K, just pad from remaining
+    if len(selected_indices) < K:
+        remaining = [i for i in range(dirs.shape[0]) if i not in selected_indices]
+        needed = K - len(selected_indices)
+        selected_indices.extend(remaining[:needed])
+
+    selected_indices = np.array(selected_indices, dtype=int)
+    return dirs[selected_indices]
+
+
+def integerize_directions(dirs: np.ndarray, W: float) -> np.ndarray:
+    """
+    Multiply direction cosines by W and round to nearest integer.
+    Returns (K,3) int32 array [p,q,r].
+    """
+    scaled = dirs * float(W)
+    pqr = np.rint(scaled).astype(np.int32)
+    return pqr
+
+
+def generate_pqr(config: Phase2Config) -> PlaneWaveSet:
+    """
+    Generate K plane-wave directions and integerised p,q,r, with octant balancing.
+    """
+    dirs = generate_plane_wave_directions(config.K, axis_avoid_deg=config.axis_avoid_deg)
+    dirs_bal = balance_octants(dirs, config.K)
+    pqr = integerize_directions(dirs_bal, config.W)
+
+    octs = octant_index(dirs_bal)
+    counts = tuple(int(np.sum(octs == i)) for i in range(8))
+
+    return PlaneWaveSet(pqr=pqr, octant_counts=counts)
 
 
 # =============================
-# Phase II operator (g, Λ, V)
+# Core operator: g, V, Lambda
 # =============================
 
 def build_g(positions: np.ndarray,
@@ -202,65 +257,95 @@ def build_g(positions: np.ndarray,
     return g.astype(np.complex128)
 
 
-def build_V_diagonal(pqr: np.ndarray) -> np.ndarray:
+def build_V_components(pqr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Build V_k from inverse cosines of direction cosines of each plane-wave direction.
+    Build per-component diagonal weights Vx, Vy, Vz from integerized plane-wave
+    directions (p, q, r).
 
-    Example scalar:
-      V_k = (arccos(ux) + arccos(uy) + arccos(uz)) / 3
+    For each plane wave k we use
+
+        Vx_k ≈ 1 / p_k
+        Vy_k ≈ 1 / q_k
+        Vz_k ≈ 1 / r_k
+
+    where (p_k, q_k, r_k) are the integer directions obtained by multiplying
+    the direction cosines by W and rounding.
+
+    Any zero entries are guarded with a small epsilon to avoid division by zero.
     """
     pqr_f = pqr.astype(np.float64)
-    norms = np.linalg.norm(pqr_f, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-12)
-    u = pqr_f / norms
+    p = pqr_f[:, 0]
+    q = pqr_f[:, 1]
+    r = pqr_f[:, 2]
 
-    ux = np.clip(u[:, 0], -1.0, 1.0)
-    uy = np.clip(u[:, 1], -1.0, 1.0)
-    uz = np.clip(u[:, 2], -1.0, 1.0)
+    eps = 1e-12
+    Vx = np.zeros_like(p, dtype=np.float64)
+    Vy = np.zeros_like(q, dtype=np.float64)
+    Vz = np.zeros_like(r, dtype=np.float64)
 
-    theta_x = np.arccos(ux)
-    theta_y = np.arccos(uy)
-    theta_z = np.arccos(uz)
+    mask_p = np.abs(p) > eps
+    mask_q = np.abs(q) > eps
+    mask_r = np.abs(r) > eps
 
-    V = (theta_x + theta_y + theta_z) / 3.0
-    return V.astype(np.float64)
+    Vx[mask_p] = 1.0 / p[mask_p]
+    Vy[mask_q] = 1.0 / q[mask_q]
+    Vz[mask_r] = 1.0 / r[mask_r]
+
+    # Any entries with |p|,|q|,|r| ≈ 0 are left at 0. The axis-avoidance rules
+    # in the plane-wave generator should prevent such cases in normal use.
+    return Vx, Vy, Vz
+
+
+def build_V_diagonal(pqr: np.ndarray) -> np.ndarray:
+    """
+    Backwards-compatible helper that returns a (K,3) array stacking
+    Vx, Vy, Vz for each plane wave.
+    """
+    Vx, Vy, Vz = build_V_components(pqr)
+    return np.column_stack([Vx, Vy, Vz])
 
 
 def compute_pressure_phase2(config: Phase2Config,
                             geom: Geometry,
                             pqr_set: PlaneWaveSet) -> Dict[str, np.ndarray]:
     """
-    Compute surface pressure using DAM 1.1 Phase II operator:
+    Compute surface pressure using DAM 1.1 Phase II operator with
+    per-component diagonal weights:
 
-      A_x = (1/N) * diag(V) * diag(Lambda^{-1}) * (g^H v_x)
-      A_y = ...
-      A_z = ...
-      p = g(A_x + A_y + A_z)
+      A_x = (1/N) * diag(Vx) * diag(Lambda^{-1}) * (g^H v_x)
+      A_y = (1/N) * diag(Vy) * diag(Lambda^{-1}) * (g^H v_y)
+      A_z = (1/N) * diag(Vz) * diag(Lambda^{-1}) * (g^H v_z)
+      p   = g (A_x + A_y + A_z)
 
     Returns fields:
       p, p_real, p_imag, p_mag, p_phase, Lambda, V
+
+    where V is a (K,3) array stacking [Vx, Vy, Vz] for each plane wave.
     """
     positions = geom.positions
     velocities = geom.velocities
+
     N = positions.shape[0]
 
-    if N != config.N:
-        config.N = N
-
+    # Build propagation matrix g and its Gram diagonal Lambda
     g = build_g(positions, pqr_set.pqr, config.W, config.lambda_)
     Lambda = (g.conj().T @ g).diagonal().real / N
     Lambda_inv = 1.0 / np.maximum(Lambda, 1e-12)
 
-    V = build_V_diagonal(pqr_set.pqr)
+    # Build per-component diagonal weights from integerised (p, q, r)
+    Vx, Vy, Vz = build_V_components(pqr_set.pqr)
 
     p_total = np.zeros(N, dtype=np.complex128)
-    for comp in range(3):
+
+    for comp, Vcomp in zip(range(3), (Vx, Vy, Vz)):
         vcomp = velocities[:, comp]
         proj = g.conj().T @ vcomp
-        A = (1.0 / N) * V * Lambda_inv * proj
+        A = (1.0 / N) * Vcomp * Lambda_inv * proj
         p_total += g @ A
 
     p = p_total
+    V = np.column_stack([Vx, Vy, Vz])
+
     return {
         "p": p,
         "p_real": p.real,
@@ -273,23 +358,22 @@ def compute_pressure_phase2(config: Phase2Config,
 
 
 # =============================
-# Streamlit UI
+# Streamlit app
 # =============================
 
 st.set_page_config(
     page_title="DAM 1.1 Phase II – Pulsating Sphere",
-    layout="wide",
+    layout="centered",
 )
 
-st.title("DAM 1.1 Phase II – Pulsating Sphere Surface Pressure")
+st.title("DAM 1.1 Phase II – Pulsating Sphere Test")
 
 st.markdown(
     """
-This app generates a **pulsating sphere** test case and computes surface
-pressure using the DAM 1.1 Phase II operator.
+Interactive prototype to exercise the DAM 1.1 Phase II operator on a pulsating
+sphere geometry.
 
-Steps:
-- Generate N points on a sphere of radius a using spherical Fibonacci.
+- Generate N points on a radius=a sphere (integerised l,m,n).
 - Assign unit radial velocity at each point.
 - Generate K plane waves (with W, axis-avoidance, octant balancing).
 - Compute pressure via DAM 1.1 Phase II.
@@ -304,120 +388,83 @@ N = st.sidebar.number_input(
     "N (number of surface points)",
     min_value=4,
     value=80,
-    step=1,
-    help="Number of points on the spherical radiator surface.",
+    step=4,
 )
 
 radius = st.sidebar.number_input(
     "Sphere radius a",
     min_value=1.0,
     value=100.0,
-    step=1.0,
-    help="Radius of the pulsating sphere.",
+    step=10.0,
 )
 
 W = st.sidebar.number_input(
-    "W (plane-wave multiplier)",
-    min_value=1.0,
-    value=500.0,
-    step=1.0,
-    help="Scaling factor before rounding (p,q,r) = round(W * unit_direction).",
+    "W (direction cosine integerization multiplier)",
+    min_value=10.0,
+    value=1000.0,
+    step=10.0,
 )
 
-mode_lambda = st.sidebar.selectbox(
-    "How to choose wavelength λ",
-    [
-        "Specify λ directly",
-        "Compute λ from ka=1 (pulsating sphere theory)",
-    ],
+lambda_mode = st.sidebar.selectbox(
+    "Wavelength λ",
+    options=["Specify λ directly", "Compute λ from ka=1 (pulsating sphere theory)"],
+    index=1,
 )
 
-if mode_lambda == "Specify λ directly":
+if lambda_mode == "Specify λ directly":
     lambda_val = st.sidebar.number_input(
         "λ (wavelength)",
-        min_value=1e-9,
-        value=2.0 * math.pi * radius,
-        step=1.0,
-        format="%.6f",
+        min_value=1.0,
+        value=680.0,
+        step=10.0,
     )
 else:
-    # ka = 1 → k = 1/a → λ = 2πa
+    # ka = 1 => k = 1/a, so λ = 2π / k = 2π a
     k = 1.0 / radius
     lambda_val = 2.0 * math.pi / k
-    st.sidebar.markdown(
-        f"Computed from ka = 1 and radius a = {radius:.3f}: "
-        f"λ ≈ {lambda_val:.3f}"
-    )
+    st.sidebar.info(f"ka=1 ⇒ λ = 2πa ≈ {lambda_val:.4g}")
 
-default_K = 3 * N
-predefined_Ks = sorted(set([800, 1600, 2400, 3200, default_K]))
-K = st.sidebar.selectbox(
+K = st.sidebar.number_input(
     "K (number of plane waves)",
-    options=predefined_Ks,
-    index=predefined_Ks.index(default_K) if default_K in predefined_Ks else len(predefined_Ks) - 1,
-    help="3N is a common default; other choices are 800,1600,2400,3200.",
+    min_value=8,
+    value=80,
+    step=8,
 )
 
-axis_avoid = st.sidebar.number_input(
-    "Axis avoid angle (deg)",
+axis_avoid = st.sidebar.slider(
+    "Axis-avoid angle (deg)",
     min_value=0.0,
-    max_value=89.9,
+    max_value=45.0,
     value=20.0,
     step=1.0,
-    help="Cone half-angle about coordinate axes to avoid plane waves close to axes.",
 )
 
-run_button = st.sidebar.button("Run Phase II computation")
-
-
-# Generate geometry preview
-pts, dirs = spherical_fibonacci_points(N, radius)
-l, m, n = pts[:, 0], pts[:, 1], pts[:, 2]
-
-df_geom_preview = pd.DataFrame({
-    "l": l,
-    "m": m,
-    "n": n,
-    "vx": dirs[:, 0],
-    "vy": dirs[:, 1],
-    "vz": dirs[:, 2],
-})
-
-st.subheader("Generated geometry and radial velocity (preview)")
-st.write(f"Sphere radius = {radius}, N = {N}")
-st.dataframe(df_geom_preview.head())
-
-with st.expander("Show 3D geometry scatter (positions only)"):
-    fig_geo = plt.figure(figsize=(5, 5))
-    axg = fig_geo.add_subplot(111, projection="3d")
-    axg.scatter(l, m, n)
-    axg.set_xlabel("l")
-    axg.set_ylabel("m")
-    axg.set_zlabel("n")
-    axg.set_title("Generated sphere points")
-    max_range = np.array([l.max()-l.min(), m.max()-m.min(), n.max()-n.min()]).max() / 2.0
-    mid_x = 0.5 * (l.max() + l.min())
-    mid_y = 0.5 * (m.max() + m.min())
-    mid_z = 0.5 * (n.max() + n.min())
-    axg.set_xlim(mid_x - max_range, mid_x + max_range)
-    axg.set_ylim(mid_y - max_range, mid_y + max_range)
-    axg.set_zlim(mid_z - max_range, mid_z + max_range)
-    st.pyplot(fig_geo)
-
-
-if not run_button:
-    st.stop()
-
-st.info("Running DAM 1.1 Phase II with generated pulsating-sphere data...")
-
-geom = build_geometry_from_sphere(N, radius)
 config = Phase2Config(
-    N=N,
-    W=W,
-    lambda_=lambda_val,
-    K=K,
-    axis_avoid_deg=axis_avoid,
+    N=int(N),
+    W=float(W),
+    lambda_=float(lambda_val),
+    K=int(K),
+    axis_avoid_deg=float(axis_avoid),
 )
+
+st.write("## Step 1: Geometry and velocities")
+
+with st.spinner("Generating pulsating sphere geometry..."):
+    geom = build_geometry_from_sphere(config.N, radius=radius)
+
+st.success("Geometry generated.")
+
+st.write(f"Generated {geom.positions.shape[0]} integerised points on a radius={radius} sphere.")
+
+if st.checkbox("Show first 10 geometry points"):
+    df_geom = pd.DataFrame(
+        np.column_stack([geom.positions, geom.velocities.real, geom.velocities.imag]),
+        columns=["l", "m", "n", "vx_real", "vy_real", "vz_real", "vx_imag", "vy_imag", "vz_imag"],
+    )
+    st.dataframe(df_geom.head(10))
+
+
+st.write("## Step 2: Plane waves and Phase II pressure")
 
 with st.spinner("Generating plane waves and computing pressure..."):
     pqr_set = generate_pqr(config)
@@ -474,17 +521,18 @@ st.download_button(
 )
 
 
-# Visualization of |p|
-st.subheader("|p| distribution (3D scatter)")
+# Optional 3D scatter of |p|
+st.subheader("3D view of |p| on the sphere")
 
 fig = plt.figure(figsize=(5, 5))
 ax = fig.add_subplot(111, projection="3d")
+
 pos = geom.positions
 p_mag = result["p_mag"]
 
-size_min = 10.0
-size_max = 80.0
-if p_mag.max() > 0:
+# Scale marker sizes by |p|
+size_min, size_max = 10.0, 80.0
+if np.ptp(p_mag) > 1e-12:
     sizes = size_min + (size_max - size_min) * (p_mag - p_mag.min()) / max(
         p_mag.max() - p_mag.min(), 1e-12
     )
